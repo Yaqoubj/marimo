@@ -10,7 +10,7 @@ from marimo import _loggers
 from marimo._config.manager import ScriptConfigReader
 from marimo._core import protocol
 from marimo._core.document import CellSource, Document, revision
-from marimo._core.errors import Conflict, NotFound
+from marimo._core.errors import Conflict, EditConflict, NotFound
 from marimo._core.executions import Executions
 from marimo._core.host import Host
 from marimo._core.notebook import Notebook
@@ -30,7 +30,9 @@ if TYPE_CHECKING:
     from marimo._core.backend import Message
     from marimo._core.document import Policy
     from marimo._core.stream import Event, Sink
+    from marimo._messaging.notebook import NotebookCell
     from marimo._server.session_manager import SessionManager
+    from marimo._session.notebook import AppFileManager
     from marimo._session.session import Session
 
 LOGGER = _loggers.marimo_logger()
@@ -128,6 +130,9 @@ class SessionBridge(SessionEventListener):
             return None
 
     def _read(self, path: str) -> tuple[list[CellSource], dict[str, Any]]:
+        return documents.from_file_manager(self._file_manager(path))
+
+    def _file_manager(self, path: str) -> AppFileManager:
         from marimo._server.app_defaults import AppDefaults
         from marimo._session.notebook import AppFileManager
 
@@ -136,9 +141,54 @@ class SessionBridge(SessionEventListener):
             if self._config_manager is None
             else AppDefaults.from_config_manager(self._config_manager)
         )
-        return documents.from_file_manager(
-            AppFileManager(path, defaults=defaults)
-        )
+        return AppFileManager(path, defaults=defaults)
+
+    async def save(
+        self,
+        notebook_id: str,
+        *,
+        if_match: Sequence[str] | None,
+        request_id: str,
+    ) -> protocol.EditResponse:
+        """Write the document's cells to its file and record the revision.
+
+        The write goes through a file manager of its own, since an
+        attached session's manager moves with the editor. It writes the
+        cells and their order and leaves the file's app config as it is.
+
+        Raises:
+            Conflict: If the notebook has no file or the write fails.
+            EditConflict: If `if_match` does not name the document's etag.
+        """
+        notebook = await self.host.notebook(notebook_id)
+        async with self._files_lock:
+            if self.host.peek_notebook(notebook_id) is not notebook:
+                raise NotFound(f"no notebook {notebook_id}")
+            file = self.index.file_of(notebook.id)
+            if file is None:
+                raise Conflict("The notebook has no file to save to")
+            # Check and snapshot only after waiting for the file lock.
+            snapshot = notebook.document.snapshot()
+            if if_match is not None and snapshot.document.etag not in if_match:
+                raise EditConflict(
+                    "The document has changed since it was read",
+                    change=0,
+                    cell=None,
+                    document=snapshot.document,
+                )
+            cells = [documents.to_notebook_cell(c) for c in snapshot.cells]
+            try:
+                await asyncio.to_thread(self._write, str(file), cells)
+            except Exception as e:
+                raise Conflict(f"The notebook cannot be saved: {e}") from e
+            document = notebook.mark_saved(
+                snapshot.document.etag, request_id=request_id
+            )
+            return protocol.EditResponse(document=document, cells={})
+
+    def _write(self, path: str, cells: list[NotebookCell]) -> None:
+        """Write the cells over the file, keeping its header and app config."""
+        self._file_manager(path).save_from_cells(cells)
 
     async def edit(
         self,

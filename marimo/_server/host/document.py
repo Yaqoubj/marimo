@@ -27,6 +27,7 @@ from marimo._messaging.notebook import (
     CreateCell,
     DeleteCell,
     DocumentChange,
+    NotebookCell,
     ReorderCells,
     SetCode,
     SetConfig,
@@ -78,6 +79,15 @@ def _cell_config(config: protocol.CellConfig) -> CellConfig:
         disabled=config.disabled,
         hide_code=config.hide_code,
         expand_output=config.expand_output,
+    )
+
+
+def to_notebook_cell(cell: protocol.Cell) -> NotebookCell:
+    return NotebookCell(
+        id=CellId_t(cell.id),
+        code=cell.code,
+        name=cell.name,
+        config=_cell_config(cell.config),
     )
 
 
