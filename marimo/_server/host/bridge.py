@@ -228,12 +228,47 @@ class SessionBridge(SessionEventListener):
         notebook = self.host.peek_notebook(notebook_id)
         if session is None or notebook is None:
             return
+        self._follow_saves(notebook_id, session)
         document = notebook.document
         if document._record.saved_etag != document._record.etag:
             documents.apply_to_session(session, document)
             return
         cells, app_config = documents.from_session(session)
         notebook.replace(cells, app_config, saved=True)
+
+    def _follow_saves(
+        self, notebook_id: protocol.NotebookId, session: Session
+    ) -> None:
+        """Record the editor's writes as the saved revision.
+
+        The file manager reports each write on the writing thread, where
+        its app is what reached disk. The revision is computed there and
+        recorded on the event loop.
+        """
+        manager = session.app_file_manager
+        loop = asyncio.get_running_loop()
+
+        def persisted() -> None:
+            etag = revision(*documents.from_file_manager(manager))
+            loop.call_soon_threadsafe(self._saved, notebook_id, etag)
+
+        manager.on_persisted = persisted
+
+    def _detach_document(
+        self, notebook_id: protocol.NotebookId, session: Session
+    ) -> None:
+        del notebook_id
+        session.app_file_manager.on_persisted = None
+
+    def _saved(
+        self, notebook_id: protocol.NotebookId, etag: protocol.Etag
+    ) -> None:
+        try:
+            notebook = self.host.peek_notebook(notebook_id)
+        except NotFound:
+            return
+        if notebook is not None:
+            notebook.mark_saved(etag)
 
     def _mirror(self, notebook_id: protocol.NotebookId) -> None:
         """Bring the document up to date with the session's after it changed."""
@@ -403,6 +438,9 @@ class SessionBridge(SessionEventListener):
             observe,
             document_changed=lambda: self._mirror(notebook_id),
             session_attached=lambda: self._attach_document(notebook_id),
+            session_detached=lambda session: self._detach_document(
+                notebook_id, session
+            ),
         )
         self._backends[notebook_id] = backend
         return backend

@@ -801,3 +801,45 @@ async def test_saving_keeps_an_edit_made_while_the_file_is_written(
     assert "x = 1" in path.read_text()
     assert "x = 2" not in path.read_text()
     bridge.close()
+
+
+async def test_the_editor_saving_marks_the_host_document_saved(
+    manager: FakeManager, tmp_path: Path
+) -> None:
+    from marimo._ast.cell import CellConfig
+    from marimo._core.document import revision
+    from marimo._messaging.notebook import NotebookCell
+    from marimo._server.host.document import from_file_manager
+    from marimo._session.notebook import AppFileManager
+    from marimo._types.ids import CellId_t
+
+    prepare(manager, tmp_path, "a.py")
+    path = tmp_path / "a.py"
+    path.write_text(NOTEBOOK)
+    bridge = SessionBridge(manager)  # type: ignore[arg-type]
+    await bridge.open()
+    record = bridge.index.notebook_for(str(path))
+    assert record is not None
+    document = (await bridge.host.notebook(record.id)).document
+    session = FakeSession(str(path))
+    session.app_file_manager = AppFileManager(str(path))
+    session.document = session.app_file_manager.app.cell_manager.document
+    manager.sessions["browser-1"] = session
+    await manager.event_bus.emit_session_created(session)  # type: ignore[arg-type]
+    (cell,) = session.document.cells
+    before = document._record.etag
+
+    # The editor writes new content the host has not mirrored yet.
+    session.app_file_manager.save_from_cells(
+        [NotebookCell(CellId_t(cell.id), "x = 2", cell.name, CellConfig())]
+    )
+    await asyncio.sleep(0)
+
+    written = revision(*from_file_manager(session.app_file_manager))
+    assert document._record.saved_etag == written
+    assert document._record.etag == before != written
+
+    # Once the session goes away, its writes are no longer the host's.
+    manager.close_session("browser-1")
+    assert session.app_file_manager.on_persisted is None
+    bridge.close()

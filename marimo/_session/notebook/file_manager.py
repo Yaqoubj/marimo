@@ -85,6 +85,11 @@ class AppFileManager:
 
         # Track the last saved content to avoid reloading our own writes
         self._last_saved_content: str | None = None
+        self.on_persisted: Callable[[], None] | None = None
+        """Called after each write to storage, on the writing thread.
+
+        Runs under the save lock, so the app reflects what was written.
+        """
 
         # Serializes concurrent writers. Reentrant so public entry points
         # can wrap the full "mutate app + _save_file" sequence while
@@ -266,6 +271,8 @@ class AppFileManager:
                 self.storage.write(path, contents)
                 # Record the last saved content to avoid reloading our own writes
                 self._mark_content_as_last_save(contents)
+                if self.on_persisted is not None:
+                    self.on_persisted()
 
             # If this is a new unnamed notebook, update the filename
             if self._is_unnamed():
