@@ -514,20 +514,6 @@ class SaveRequest(Struct, frozen=True):
     ) = UNSET
 
 
-class SetAppConfig(
-    Struct, frozen=True, tag_field="kind", tag="set_app_config"
-):
-    app_config: Annotated[
-        dict[str, Any], Meta(description="The new app config, whole.")
-    ]
-    base_etag: Annotated[
-        str,
-        Meta(
-            description="The document's `app_config_etag` as last read, or `*`."
-        ),
-    ]
-
-
 class SetOrder(Struct, frozen=True, tag_field="kind", tag="set_order"):
     base_etag: Annotated[
         str,
@@ -696,7 +682,7 @@ class CellMessage(Struct, frozen=True):
 
 
 Change: TypeAlias = Annotated[
-    PutCell | DeleteCell | SetOrder | SetAppConfig,
+    PutCell | DeleteCell | SetOrder,
     Meta(description="One change to the document, tagged on `kind`."),
 ]
 
@@ -824,7 +810,7 @@ class Document(Struct, frozen=True):
     app_config: Annotated[
         dict[str, Any],
         Meta(
-            description="Notebook-level settings, the keyword arguments to `marimo.App` such as `width` and `title`."
+            description="Notebook-level settings, the keyword arguments to `marimo.App` such as `width` and `app_title`. Informational for now; no change sets it over this protocol."
         ),
     ]
     app_config_etag: Annotated[
@@ -898,7 +884,7 @@ class EditConflict(Struct, frozen=True):
         Annotated[
             Cell,
             Meta(
-                description="The cell the change named, as it now is. Null when the document does not have it, or when the change named the order or the app config."
+                description="The cell the change named, as it now is. Null when the document does not have it, or when the change named the order."
             ),
         ]
         | None
