@@ -10,7 +10,13 @@ from marimo import _loggers
 from marimo._config.manager import ScriptConfigReader
 from marimo._core import protocol
 from marimo._core.document import CellSource, Document, revision
-from marimo._core.errors import Conflict, EditConflict, NotFound
+from marimo._core.errors import (
+    Conflict,
+    DecisionRequired,
+    EditConflict,
+    Invalid,
+    NotFound,
+)
 from marimo._core.executions import Executions
 from marimo._core.host import Host
 from marimo._core.notebook import Notebook
@@ -23,12 +29,12 @@ from marimo._session.events import SessionEventListener
 from marimo._session.notebook.storage import rename_no_replace
 
 if TYPE_CHECKING:
-    from collections.abc import Sequence
+    from collections.abc import Mapping, Sequence
     from pathlib import Path
 
     from marimo._config.manager import MarimoConfigManager
     from marimo._core.backend import Message
-    from marimo._core.document import Policy
+    from marimo._core.document import Changed, Policy
     from marimo._core.stream import Event, Sink
     from marimo._messaging.notebook import NotebookCell
     from marimo._server.session_manager import SessionManager
@@ -36,6 +42,28 @@ if TYPE_CHECKING:
     from marimo._session.session import Session
 
 LOGGER = _loggers.marimo_logger()
+
+_FILE_CHANGED = protocol.Decision(
+    id="file",
+    prompt="The notebook file changed outside marimo. Overwrite it with the document, or reload the document from it?",
+    options=(
+        protocol.DecisionOption(id="overwrite", label="Overwrite the file"),
+        protocol.DecisionOption(id="reload", label="Reload from the file"),
+    ),
+)
+
+
+def _etags(
+    changed: Changed, document: protocol.Document
+) -> protocol.EditResponse:
+    """An edit response for a replacement, with etags for what changed."""
+    cells: dict[str, protocol.CellEtags | None] = {
+        cell.id: protocol.CellEtags(etag=cell.etag, code_hash=cell.code_hash)
+        for cell in changed.cells
+    }
+    for cell_id in changed.removed:
+        cells[cell_id] = None
+    return protocol.EditResponse(document=document, cells=cells)
 
 
 # TODO: Remove once sessions consume host-owned notebooks.
@@ -148,6 +176,7 @@ class SessionBridge(SessionEventListener):
         notebook_id: str,
         *,
         if_match: Sequence[str] | None,
+        decisions: Mapping[str, str] | None = None,
         request_id: str,
     ) -> protocol.EditResponse:
         """Write the document's cells to its file and record the revision.
@@ -156,9 +185,17 @@ class SessionBridge(SessionEventListener):
         attached session's manager moves with the editor. It writes the
         cells and their order and leaves the file's app config as it is.
 
+        Without a session, a file that changed since the host last read
+        or wrote it is not overwritten until the client decides to, or
+        asks to reload the document from it instead. With a session,
+        the editor owns the file and watches it itself.
+
         Raises:
             Conflict: If the notebook has no file or the write fails.
             EditConflict: If `if_match` does not name the document's etag.
+            DecisionRequired: If the file changed and `decisions` has no
+                answer for it.
+            Invalid: If `decisions` has an answer this host does not offer.
         """
         notebook = await self.host.notebook(notebook_id)
         async with self._files_lock:
@@ -176,6 +213,30 @@ class SessionBridge(SessionEventListener):
                     cell=None,
                     document=snapshot.document,
                 )
+            if self._session_of(notebook.id) is None:
+                loaded = await self._load(file)
+                if (
+                    loaded is not None
+                    and snapshot.document.saved_etag is not None
+                    and revision(*loaded) != snapshot.document.saved_etag
+                ):
+                    answer = (decisions or {}).get(_FILE_CHANGED.id)
+                    if answer is None:
+                        raise DecisionRequired(
+                            "The file changed outside marimo",
+                            decisions=(_FILE_CHANGED,),
+                        )
+                    if answer == "reload":
+                        return _etags(
+                            notebook.replace(
+                                *loaded, saved=True, request_id=request_id
+                            ),
+                            notebook.document._record,
+                        )
+                    if answer != "overwrite":
+                        raise Invalid(
+                            f"{answer!r} is not an option for {_FILE_CHANGED.id}"
+                        )
             cells = [documents.to_notebook_cell(c) for c in snapshot.cells]
             try:
                 await asyncio.to_thread(self._write, str(file), cells)
